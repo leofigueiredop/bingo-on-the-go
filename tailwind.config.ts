@@ -61,6 +61,24 @@ export default {
 					'accent-foreground': 'hsl(var(--sidebar-accent-foreground))',
 					border: 'hsl(var(--sidebar-border))',
 					ring: 'hsl(var(--sidebar-ring))'
+				},
+				bingo: {
+					ball: 'hsl(var(--bingo-ball))',
+					'ball-foreground': 'hsl(var(--bingo-ball-foreground))',
+					called: 'hsl(var(--bingo-called))',
+					'called-foreground': 'hsl(var(--bingo-called-foreground))',
+					marked: 'hsl(var(--bingo-marked))',
+					'marked-foreground': 'hsl(var(--bingo-marked-foreground))',
+					winner: 'hsl(var(--bingo-winner))',
+					'winner-foreground': 'hsl(var(--bingo-winner-foreground))'
+				},
+				success: {
+					DEFAULT: 'hsl(var(--success))',
+					foreground: 'hsl(var(--success-foreground))'
+				},
+				warning: {
+					DEFAULT: 'hsl(var(--warning))',
+					foreground: 'hsl(var(--warning-foreground))'
 				}
 			},
 			borderRadius: {
