@@ -14,7 +14,10 @@ import {
   Plus,
   Settings,
   TrendingUp,
-  Activity
+  Activity,
+  Pause,
+  RotateCcw,
+  Zap
 } from 'lucide-react';
 import { Navigate } from 'react-router-dom';
 
@@ -34,6 +37,16 @@ interface RoomFormData {
   bingo_prize: number;
 }
 
+interface ActiveRoom {
+  id: string;
+  name: string;
+  status: 'waiting' | 'playing' | 'finished';
+  current_players: number;
+  max_players: number;
+  called_numbers: number[];
+  current_number?: number;
+}
+
 const AdminPanel = () => {
   const { user } = useAuth();
   const { toast } = useToast();
@@ -43,6 +56,7 @@ const AdminPanel = () => {
     activeRooms: 0,
     totalRevenue: 0,
   });
+  const [activeRooms, setActiveRooms] = useState<ActiveRoom[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [showCreateRoom, setShowCreateRoom] = useState(false);
@@ -61,6 +75,28 @@ const AdminPanel = () => {
   useEffect(() => {
     if (isAdmin) {
       fetchStats();
+      fetchActiveRooms();
+      
+      // Set up real-time subscription for room updates
+      const channel = supabase
+        .channel('admin_rooms')
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'bingo_rooms',
+          },
+          () => {
+            fetchActiveRooms();
+            fetchStats();
+          }
+        )
+        .subscribe();
+
+      return () => {
+        channel.unsubscribe();
+      };
     }
   }, [isAdmin]);
 
@@ -106,6 +142,21 @@ const AdminPanel = () => {
     }
   };
 
+  const fetchActiveRooms = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('bingo_rooms')
+        .select('*')
+        .in('status', ['waiting', 'playing'])
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      setActiveRooms(data || []);
+    } catch (error: any) {
+      console.error('Error fetching active rooms:', error);
+    }
+  };
+
   const createRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     setCreating(true);
@@ -123,6 +174,8 @@ const AdminPanel = () => {
             bingo: roomForm.bingo_prize,
           },
           status: 'waiting',
+          current_players: 0,
+          called_numbers: [],
         });
 
       if (error) throw error;
@@ -142,6 +195,7 @@ const AdminPanel = () => {
         bingo_prize: 1000,
       });
       fetchStats();
+      fetchActiveRooms();
     } catch (error: any) {
       toast({
         title: "Erro ao criar sala",
@@ -150,6 +204,127 @@ const AdminPanel = () => {
       });
     } finally {
       setCreating(false);
+    }
+  };
+
+  const forceStartGame = async (roomId: string) => {
+    try {
+      const { error } = await supabase
+        .from('bingo_rooms')
+        .update({
+          status: 'playing',
+          start_time: new Date().toISOString(),
+          next_number_at: new Date(Date.now() + 5000).toISOString(),
+        })
+        .eq('id', roomId);
+
+      if (error) throw error;
+
+      toast({
+        title: "Jogo iniciado",
+        description: "O jogo foi iniciado manualmente.",
+      });
+    } catch (error: any) {
+      toast({
+        title: "Erro ao iniciar jogo",
+        description: error.message,
+        variant: "destructive",
+      });
+    }
+  };
+
+  const pauseGame = async (roomId: string) => {
+    try {
+      const { error } = await supabase
+        .from('bingo_rooms')
+        .update({
+          next_number_at: null,
+        })
+        .eq('id', roomId);
+
+      if (error) throw error;
+
+      toast({
+        title: "Jogo pausado",
+        description: "O sorteio foi pausado.",
+      });
+    } catch (error: any) {
+      toast({
+        title: "Erro ao pausar jogo",
+        description: error.message,
+        variant: "destructive",
+      });
+    }
+  };
+
+  const endGame = async (roomId: string) => {
+    try {
+      const { error } = await supabase
+        .from('bingo_rooms')
+        .update({
+          status: 'finished',
+          end_time: new Date().toISOString(),
+          next_number_at: null,
+        })
+        .eq('id', roomId);
+
+      if (error) throw error;
+
+      toast({
+        title: "Jogo finalizado",
+        description: "O jogo foi finalizado manualmente.",
+      });
+    } catch (error: any) {
+      toast({
+        title: "Erro ao finalizar jogo",
+        description: error.message,
+        variant: "destructive",
+      });
+    }
+  };
+
+  const drawNumber = async (roomId: string) => {
+    try {
+      const room = activeRooms.find(r => r.id === roomId);
+      if (!room) return;
+
+      const availableNumbers = Array.from({ length: 75 }, (_, i) => i + 1)
+        .filter(num => !room.called_numbers.includes(num));
+
+      if (availableNumbers.length === 0) {
+        toast({
+          title: "Todos os números foram sorteados",
+          description: "Não há mais números disponíveis.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const randomIndex = Math.floor(Math.random() * availableNumbers.length);
+      const drawnNumber = availableNumbers[randomIndex];
+      const newCalledNumbers = [...room.called_numbers, drawnNumber];
+
+      const { error } = await supabase
+        .from('bingo_rooms')
+        .update({
+          current_number: drawnNumber,
+          called_numbers: newCalledNumbers,
+          next_number_at: new Date(Date.now() + 10000).toISOString(),
+        })
+        .eq('id', roomId);
+
+      if (error) throw error;
+
+      toast({
+        title: "Número sorteado",
+        description: `Número ${drawnNumber} foi sorteado!`,
+      });
+    } catch (error: any) {
+      toast({
+        title: "Erro ao sortear número",
+        description: error.message,
+        variant: "destructive",
+      });
     }
   };
 
@@ -237,6 +412,97 @@ const AdminPanel = () => {
           </CardContent>
         </Card>
       </div>
+
+      {/* Active Rooms Management */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Activity className="h-5 w-5" />
+            Controle de Salas Ativas
+          </CardTitle>
+          <CardDescription>
+            Gerencie jogos em tempo real
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {activeRooms.length === 0 ? (
+            <p className="text-muted-foreground text-center py-8">
+              Nenhuma sala ativa no momento
+            </p>
+          ) : (
+            <div className="space-y-4">
+              {activeRooms.map((room) => (
+                <div key={room.id} className="border rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <h3 className="font-semibold">{room.name}</h3>
+                      <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                        <span>{room.current_players}/{room.max_players} jogadores</span>
+                        <Badge variant={room.status === 'playing' ? 'default' : 'secondary'}>
+                          {room.status === 'waiting' ? 'Aguardando' : 'Em andamento'}
+                        </Badge>
+                        {room.called_numbers.length > 0 && (
+                          <span>{room.called_numbers.length} números sorteados</span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      {room.status === 'waiting' && (
+                        <Button
+                          size="sm"
+                          onClick={() => forceStartGame(room.id)}
+                          className="text-xs"
+                        >
+                          <Play className="h-3 w-3 mr-1" />
+                          Iniciar
+                        </Button>
+                      )}
+                      {room.status === 'playing' && (
+                        <>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => drawNumber(room.id)}
+                            className="text-xs"
+                          >
+                            <Zap className="h-3 w-3 mr-1" />
+                            Sortear
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => pauseGame(room.id)}
+                            className="text-xs"
+                          >
+                            <Pause className="h-3 w-3 mr-1" />
+                            Pausar
+                          </Button>
+                        </>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        onClick={() => endGame(room.id)}
+                        className="text-xs"
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />
+                        Finalizar
+                      </Button>
+                    </div>
+                  </div>
+                  
+                  {room.current_number && (
+                    <div className="bg-primary/10 rounded p-2 text-center">
+                      <span className="text-sm text-muted-foreground">Último número: </span>
+                      <span className="font-bold text-lg text-primary">{room.current_number}</span>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Create Room Section */}
       <Card>

@@ -4,7 +4,9 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { Progress } from '@/components/ui/progress';
 import { useAuth } from '@/hooks/useAuth';
+import { useBingoGame } from '@/hooks/useBingoGame';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import { 
@@ -14,7 +16,10 @@ import {
   Crown,
   MessageCircle,
   Volume2,
-  VolumeX
+  VolumeX,
+  Play,
+  Timer,
+  Trophy
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -66,24 +71,56 @@ const BingoRoom = () => {
   const { toast } = useToast();
   const navigate = useNavigate();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const didInitRef = useRef<boolean>(false);
+  const isJoiningRef = useRef<boolean>(false);
+  const cardRef = useRef<BingoCard | null>(null);
+  const roomStatusRef = useRef<string | null>(null);
   
-  const [room, setRoom] = useState<BingoRoom | null>(null);
+  const {
+    room,
+    winners,
+    loading: gameLoading,
+    timeUntilNext,
+    startGame,
+    setupGameSubscription,
+    loadRoom
+  } = useBingoGame();
+  
   const [card, setCard] = useState<BingoCard | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [loading, setLoading] = useState(true);
   const [soundEnabled, setSoundEnabled] = useState(true);
 
+  // keep refs in sync without triggering effects
+  useEffect(() => {
+    cardRef.current = card;
+  }, [card]);
+  useEffect(() => {
+    roomStatusRef.current = room?.status ?? null;
+  }, [room?.status]);
+
   useEffect(() => {
     if (!roomId || !user) return;
-    
+    if (didInitRef.current) return;
+    didInitRef.current = true;
+
+    // Carrega estado inicial da sala para evitar tela vazia até o primeiro UPDATE
+    loadRoom(roomId);
+
     fetchRoomData();
-    setupRealtimeSubscriptions();
+    const cleanupChat = setupRealtimeSubscriptions();
+    const unsubscribe = setupGameSubscription(roomId);
     
     return () => {
-      // Cleanup subscriptions
+      // Se o usuário sair antes do jogo começar, libera a vaga e remove a cartela
+      if (cardRef.current && roomStatusRef.current === 'waiting') {
+        void supabase.rpc('leave_room', { room_id: roomId, user_id: user.id });
+      }
+      cleanupChat?.();
+      unsubscribe();
     };
-  }, [roomId, user]);
+  }, [roomId, user, setupGameSubscription, loadRoom]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -100,8 +137,7 @@ const BingoRoom = () => {
         .eq('id', roomId)
         .single();
 
-      if (roomError) throw roomError;
-      setRoom(roomData);
+              if (roomError) throw roomError;
 
       // Fetch or create user's card
       let { data: cardData, error: cardError } = await supabase
@@ -114,37 +150,32 @@ const BingoRoom = () => {
       if (cardError && cardError.code !== 'PGRST116') throw cardError;
 
       if (!cardData) {
-        // Create new card
-        const newCard = generateBingoCard();
-        const { data: createdCard, error: createError } = await supabase
-          .from('bingo_cards')
-          .insert({
-            room_id: roomId,
-            user_id: user.id,
-            numbers: newCard,
-            marked_positions: [],
-          })
-          .select()
-          .single();
+        if (isJoiningRef.current) return; // evita múltiplas entradas simultâneas
+        isJoiningRef.current = true;
 
-        if (createError) throw createError;
-        cardData = createdCard;
-
-        // Deduct card price from user balance
-        const { error: balanceError } = await supabase.rpc('deduct_balance', {
-          user_id: user.id,
-          amount: roomData.card_price
-        });
-
-        if (balanceError) {
+        try {
+          // Usa RPC transacional: enter_room(p_room_id, p_user_id, p_numbers, p_amount)
+          const newCard = generateBingoCard();
+          const { data, error } = await supabase.rpc('enter_room', {
+            p_room_id: roomId,
+            p_user_id: user.id,
+            p_numbers: newCard,
+            p_amount: roomData.card_price,
+          });
+          if (error) throw error;
+          cardData = data as any;
+        } catch (err: any) {
           toast({
-            title: "Erro ao processar pagamento",
-            description: balanceError.message,
-            variant: "destructive",
+            title: 'Erro ao entrar na sala',
+            description: err.message || 'Tente novamente em instantes.',
+            variant: 'destructive',
           });
           navigate('/');
+          isJoiningRef.current = false;
           return;
         }
+
+        isJoiningRef.current = false;
       }
 
       setCard(cardData);
@@ -180,26 +211,6 @@ const BingoRoom = () => {
   const setupRealtimeSubscriptions = () => {
     if (!roomId) return;
 
-    // Subscribe to room updates
-    const roomChannel = supabase
-      .channel(`room_${roomId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'bingo_rooms',
-          filter: `id=eq.${roomId}`,
-        },
-        (payload) => {
-          setRoom(payload.new as BingoRoom);
-          if (payload.new.current_number && soundEnabled) {
-            // Play sound for new number
-          }
-        }
-      )
-      .subscribe();
-
     // Subscribe to chat messages
     const chatChannel = supabase
       .channel(`chat_${roomId}`)
@@ -230,6 +241,10 @@ const BingoRoom = () => {
         }
       )
       .subscribe();
+
+    return () => {
+      chatChannel.unsubscribe();
+    };
   };
 
   const generateBingoCard = (): number[] => {
@@ -386,6 +401,12 @@ const BingoRoom = () => {
     return ['B', 'I', 'N', 'G', 'O'][col];
   };
 
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   if (loading) {
     return (
       <div className="container mx-auto p-6">
@@ -446,28 +467,62 @@ const BingoRoom = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      {/* Game Status */}
+      {room?.status === 'waiting' && (
+        <Card className="mb-6 border-blue-200 bg-blue-50">
+          <CardContent className="pt-4">
+            <div className="flex items-center gap-2 text-blue-700">
+              <Timer className="h-5 w-5" />
+              <span className="font-medium">
+                Aguardando mais jogadores... Mínimo: 2 jogadores
+              </span>
+            </div>
+            <Progress 
+              value={(room.current_players / 2) * 100} 
+              className="mt-2 h-2" 
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {room?.status === 'playing' && timeUntilNext > 0 && (
+        <Card className="mb-6 border-green-200 bg-green-50">
+          <CardContent className="pt-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-green-700">
+                <Play className="h-5 w-5" />
+                <span className="font-medium">Próximo número em:</span>
+              </div>
+              <Badge variant="outline" className="text-lg font-mono">
+                {formatTime(timeUntilNext)}
+              </Badge>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-6 items-start">
         {/* Bingo Card */}
         <div className="lg:col-span-2 space-y-4">
-          <Card>
-            <CardHeader>
+          <Card className="rounded-2xl border-yellow-500/20 shadow-[0_0_0_1px_rgba(0,0,0,0.08)]">
+            <CardHeader className="pb-2">
               <div className="flex items-center justify-between">
-                <CardTitle>Sua Cartela</CardTitle>
-                <div className="flex gap-2">
-                  {card.has_quadra && <Badge variant="outline">Quadra</Badge>}
-                  {card.has_quina && <Badge variant="outline">Quina</Badge>}
-                  {card.has_bingo && <Badge className="bg-bingo-winner text-bingo-winner-foreground">Bingo!</Badge>}
-                </div>
+                                  <CardTitle className="text-xl lg:text-2xl font-extrabold tracking-wide">Sua Cartela</CardTitle>
+                  <div className="flex gap-2">
+                    {card.has_quadra && <Badge variant="outline" className="text-yellow-600">Quadra</Badge>}
+                    {card.has_quina && <Badge variant="outline" className="text-orange-600">Quina</Badge>}
+                    {card.has_bingo && <Badge className="bg-green-600 text-white">Bingo!</Badge>}
+                  </div>
               </div>
             </CardHeader>
             <CardContent>
               <div className="space-y-2">
                 {/* BINGO Header */}
-                <div className="grid grid-cols-5 gap-2 mb-4">
+                <div className="grid grid-cols-5 gap-1.5 lg:gap-2 mb-3 lg:mb-4">
                   {['B', 'I', 'N', 'G', 'O'].map((letter) => (
                     <div
                       key={letter}
-                      className="h-12 flex items-center justify-center bg-primary text-primary-foreground rounded font-bold text-xl"
+                      className="h-10 lg:h-12 flex items-center justify-center bg-primary text-primary-foreground rounded-xl font-extrabold text-lg lg:text-xl shadow-inner"
                     >
                       {letter}
                     </div>
@@ -475,7 +530,7 @@ const BingoRoom = () => {
                 </div>
 
                 {/* Numbers Grid */}
-                <div className="grid grid-cols-5 gap-2">
+                <div className="grid grid-cols-5 gap-1.5 lg:gap-2">
                   {card.numbers.map((number, index) => {
                     const isMarked = card.marked_positions.includes(index);
                     const isFree = number === 0;
@@ -487,18 +542,18 @@ const BingoRoom = () => {
                         onClick={() => markNumber(index)}
                         disabled={isFree || isMarked || room.status !== 'playing'}
                         className={cn(
-                          "h-12 flex items-center justify-center rounded font-semibold transition-all",
-                          isFree 
-                            ? "bg-muted text-muted-foreground cursor-default"
-                            : isMarked
-                            ? "bg-bingo-marked text-bingo-marked-foreground"
-                            : wasCalled
-                            ? "bg-bingo-called text-bingo-called-foreground hover:bg-bingo-marked hover:text-bingo-marked-foreground"
+                          "h-12 lg:h-14 flex items-center justify-center rounded-xl font-extrabold text-lg lg:text-2xl transition-all",
+                                                      isFree 
+                              ? "bg-muted text-muted-foreground cursor-default"
+                              : isMarked
+                              ? "bg-green-500 text-white"
+                              : wasCalled
+                              ? "bg-yellow-200 text-yellow-800 hover:bg-green-500 hover:text-white"
                             : "bg-card hover:bg-accent",
                           !isFree && !isMarked && room.status === 'playing' && "cursor-pointer"
                         )}
                       >
-                        {isFree ? 'FREE' : number}
+                        {isFree ? 'FREE' : <span className="drop-shadow-[0_1px_0_rgba(0,0,0,0.4)]">{number}</span>}
                       </button>
                     );
                   })}
@@ -525,8 +580,30 @@ const BingoRoom = () => {
           )}
         </div>
 
-        {/* Chat and Info */}
-        <div className="space-y-4">
+        {/* Side Panel */}
+        <div className="space-y-4 lg:sticky lg:top-4 max-h-[calc(100vh-120px)] overflow-auto">
+          {/* Winners */}
+          {winners.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Trophy className="h-5 w-5" />
+                  Vencedores
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {winners.map((winner, index) => (
+                  <div key={index} className="flex justify-between text-sm">
+                    <span className="font-medium">{winner.username}</span>
+                    <span className="text-muted-foreground">
+                      {winner.prize_type} - R$ {winner.prize_amount}
+                    </span>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          )}
+
           {/* Prizes */}
           <Card>
             <CardHeader>
@@ -552,14 +629,14 @@ const BingoRoom = () => {
           </Card>
 
           {/* Chat */}
-          <Card className="h-96 flex flex-col">
+          <Card className="flex flex-col lg:max-h-[calc(100vh-220px)]">
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-lg">
                 <MessageCircle className="h-5 w-5" />
                 Chat
               </CardTitle>
             </CardHeader>
-            <CardContent className="flex-1 flex flex-col gap-2 p-4">
+            <CardContent className="flex-1 flex flex-col gap-2 p-4 min-h-[320px]">
               <div className="flex-1 overflow-auto space-y-2 mb-2">
                 {messages.map((message) => (
                   <div key={message.id} className="text-sm">
