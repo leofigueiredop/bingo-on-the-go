@@ -11,6 +11,7 @@ import Dashboard from "./pages/Dashboard";
 import Profile from "./pages/Profile";
 import Deposits from "./pages/Deposits";
 import BingoRoom from "./pages/BingoRoom";
+import LiveBingoPage from "./pages/LiveBingo";
 import AdminPanel from "./pages/AdminPanel";
 import NotFound from "./pages/NotFound";
 import Rooms from "./pages/Rooms";
@@ -37,6 +38,7 @@ const App = () => (
             }>
               <Route index element={<Dashboard />} />
               <Route path="rooms" element={<Rooms />} />
+              <Route path="live-bingo" element={<LiveBingoPage />} />
               <Route path="profile" element={<Profile />} />
               <Route path="deposits" element={<Deposits />} />
               <Route path="bingo/:roomId" element={<BingoRoom />} />
